@@ -1,0 +1,465 @@
+#include<unistd.h>
+#include"iostream"
+#include<opencv2/opencv.hpp>
+#include<thread>
+#include<list>
+
+#include"ImgProdCons.h"
+#include"./Armor/ArmorDetector.h"
+#include"./Pose/AngleSolver.hpp"
+#include"./KCF/kcftracker.hpp"
+
+using namespace std;
+using namespace cv;
+
+//#define _DEBUG
+//#define GET_VIDEO
+
+namespace rm
+{
+Rect get_kcf_roi(std::vector<Point2f> vec)
+{
+    Rect rect;
+    std::vector<Point2f> _vec;
+    float x_01 = (vec[1].x - vec[0].x) / 3;
+    float x_32 = (vec[2].x - vec[3].x) / 3;
+    float y_01 = (vec[1].y - vec[0].y) / 3;
+    float y_32 = (vec[2].y - vec[3].y) / 3;
+    //std::cout << "111" << endl;
+    _vec.push_back(Point2f(vec[0].x + x_01, vec[0].y + y_01));
+    _vec.push_back(Point2f(vec[1].x - x_01, vec[1].y - y_01));
+    _vec.push_back(Point2f(vec[3].x + x_32, vec[3].y + y_32));
+    _vec.push_back(Point2f(vec[2].x - x_32, vec[2].y - y_32));
+    rect = boundingRect(_vec);
+    return rect;
+}
+
+
+
+struct para
+{
+    float oldPeakValue[20];
+    unsigned int crntCount = 0;
+    unsigned int continueLost = 0;
+    bool lost = false;
+};
+
+bool isTargetLost(float crntPeakValue, para* _para)
+{
+    const unsigned int k_count = 20;
+
+    if (_para->lost)
+    {
+        return true;
+    }
+    else
+    {
+        if (_para->crntCount >= k_count)
+        {
+            double u = 0;
+            for (unsigned int ui = 0; ui < k_count; ui++)
+            {
+                u += _para->oldPeakValue[ui];
+            }
+            u /= k_count;
+
+            double sigma = 0;
+            for (unsigned int ui = 0; ui < k_count; ui++)
+            {
+                sigma += (_para->oldPeakValue[ui] - u) * (_para->oldPeakValue[ui] - u);
+            }
+            sigma /= k_count;
+            sigma = sqrt(sigma);
+
+            double threshold = max(u - sigma * 4, 0.3);
+
+            std::cout << "u: " << u << ", sigma: " << sigma << ", u-sigma*lamda: " << threshold << endl;
+
+            if (crntPeakValue < threshold)
+            {
+                if (_para->continueLost > 3)
+                {
+                    _para->lost = true;
+                    return true;
+                }
+                else
+                {
+                    _para->continueLost++;
+                }
+            }
+            else
+            {
+                _para->oldPeakValue[_para->crntCount % k_count] = crntPeakValue; // update peak value list
+                _para->continueLost = 0;
+            }
+        }
+        else
+        {
+            _para->oldPeakValue[_para->crntCount] = crntPeakValue;
+
+            if (crntPeakValue < 0.5)
+            {
+                if (_para->continueLost > 3)
+                {
+                    _para->lost = true;
+                    return true;
+                }
+                else
+                {
+                    _para->continueLost++;
+                }
+            }
+            else
+            {
+                _para->continueLost = 0;
+            }
+        }
+    }
+
+    _para->crntCount++;
+
+    return false;
+}
+
+void ImgProdCons::init()
+{
+    //prevent usb port from being blocked
+    init_signals();
+
+    //Initialize camera
+    _videoCapturePtr->open(0,2); // 0 works fine for small panel , if you meet problem opening the camera, try change this
+    _videoCapturePtr->setVideoFormat(1280, 720, true);
+    _videoCapturePtr->setExposureTime(12);
+    _videoCapturePtr->setFPS(60);
+    _videoCapturePtr->setBalanceRatio(1.6,1.35,2.1);
+    _videoCapturePtr->setGain(1);
+    _videoCapturePtr->setGamma(1);
+
+    _videoCapturePtr->startStream();
+    _videoCapturePtr->closeStream();
+    _videoCapturePtr->startStream();
+    _videoCapturePtr->info();
+
+    //Initilize serial
+    _serialPtr->openPort();
+    _serialPtr->setDebug(false);
+    int self_color =rm::RED;
+    while(_serialPtr->setup(self_color) != Serial::OJBK)
+    {
+        sleep(1);
+    }
+    self_color =rm::RED;
+    cout << "I am " << (self_color == rm::BLUE ? "blue" : "red") << "." << endl;
+
+    //Initialize angle solver
+    AngleSolverParam angleParam;
+    angleParam.readFile(11);//camera number sentry =11
+    _solverPtr->init(angleParam);
+    _solverPtr->setResolution(_videoCapturePtr->getResolution());
+
+    //Initialize armor detector
+    ArmorParam armorParam;
+    _armorDetectorPtr->init(armorParam);
+    _armorDetectorPtr->setEnemyColor(self_color == rm::BLUE ? rm::RED : rm::BLUE);
+}
+
+//void updateFeeling(list<double>& feeling, const double duration)
+//{
+//    for(auto it = feeling.begin(); it != feeling.end(); it++)
+//    {
+//        if(*it < 10)
+//        {
+//            feeling.erase(it);
+//        }
+//        else
+//        {
+//            *it *= exp(0.1*duration);
+//        }
+//    }
+//}
+
+void ImgProdCons::sense()
+{
+    //	chrono::time_point<chrono::steady_clock> lastTime;
+    //	list<double> worrys0, worrys1, pains;
+    //	double totalWorry0, totalWorry1, totalPain;
+    //	const double TAU = 0.1;
+    //	const double M = 10;
+    //	int remainHp = 3000;
+
+    /* Loop for sensing */
+    for(;;)
+    {
+        FeedBackData feedBackData;
+//        auto t1 = chrono::high_resolution_clock::now();
+        /* TODO: Handel exceptions when socket suddenly being plugged out. */
+        if(_serialPtr->tryFeedBack(feedBackData, chrono::milliseconds(6)) == Serial::OJBK)
+        {
+//            auto t2 = chrono::high_resolution_clock::now();
+//            cout << "Capture period: " << (static_cast<chrono::duration<double, std::milli>>(t2 - t1)).count() << " ms" << endl;
+            //			const auto nowTime = chrono::high_resolution_clock::now();
+            //			const auto duration = (static_cast<chrono::duration<double, std::milli>>(nowTime - lastTime)).count();
+
+            //			/*	Update historic worrys and pain */
+            //			updateFeeling(worrys0, duration);
+            //			updateFeeling(worrys1, duration);
+            //			updateFeeling(pains, duration);
+
+            //TODO: add other states
+            _task = feedBackData.task_mode;
+
+            //			auto pain = remainHp - feedBackData.remain_hp;
+            //			remainHp = feedBackData.remain_hp;
+            //			if(feedBackData.shot_armor == 0)
+            //			{
+            //				worrys0.push_back(pain);
+            //				pains.push_back(pain);
+            //			}
+            //			else if(feedBackData.shot_armor == 1)
+            //			{
+            //				worrys1.push_back(pain);
+            //				pains.push_back(pain);
+            //			}
+
+            //			totalWorry0 = accumulate()
+
+
+            //			lastTime = nowTime;
+            //cout<<"sense"<<endl;
+            this_thread::sleep_for(chrono::milliseconds(80));
+
+        }
+        else
+        {
+            //cout<<"??sense"<<endl;
+            this_thread::sleep_for(chrono::milliseconds(50));
+        }
+    }
+}
+
+void ImgProdCons::consume()
+{
+    /*
+     * Variables for recording camera
+     */
+    VideoWriter writer;
+    bool isRecording = false;
+    time_t t;
+    time(&t);
+    const string fileName = "/home/nvidia/Robomaster/Robomaster2018/" + to_string(t) + ".avi";
+    writer.open(fileName, CV_FOURCC('M', 'J', 'P', 'G'), 25, Size(1280, 720));
+
+
+    /* Variables for serial communication*/
+    ControlData controlData;
+    controlData.gimbal_mode = Serial::PATROL_AROUND;
+
+    /* Variables for angle solve module */
+    int angleFlag;
+    Vec2f targetAngle;
+
+    /* Variables for armor detector modeule */
+    int armorFlag;
+    int armorType;
+    std::vector<cv::Point2f> armorVertex;
+    cv::Point2f target_center;
+
+    /* Variables for KCF tracker */
+    para * _para = new para{{0}, 0, 0, false};
+    bool HOG = true;
+    bool FIXEDWINDOW = false;
+    bool MULTISCALE = true;
+    bool LAB = false;
+    KCFTracker tracker(HOG, FIXEDWINDOW, MULTISCALE, LAB);
+    Rect kcf_roi;
+    Rect kcf_result;
+    float peak_value = 0;
+    chrono::high_resolution_clock::time_point t1, t2;
+
+    /* The main loop for armor detection */
+    Frame frame;
+    enum{ARMOR_DETECT = 0, KCF_TRACKER = 1};
+    int detect_mode = ARMOR_DETECT;
+
+    //cout<<"2";
+    for(;;)
+    {
+
+        if(_serialPtr->getErrorCode() == Serial::SYSTEM_ERROR || !_videoCapturePtr->isOpened())
+        {
+            this_thread::sleep_for(chrono::seconds(3));
+        }
+
+
+        // comment this part when debugging without STM upper computer
+
+        //        if(_task != Serial::AUTO_SHOOT)
+        //        {
+        //            cout << "waiting for command." << endl;
+        //            continue;
+        //        }
+
+        if(!_buffer.getLatest(frame)) continue;
+
+        /* detect lightbar */
+//        if(controlData.gimbal_mode == Serial::PATROL_AROUND)
+//        {
+//            _armorDetectorPtr->loadImg(frame.img);
+
+//            if(!_armorDetectorPtr->detect_lightbar())
+//            {
+//                cout<<"Nothing"<<endl;
+//                continue;
+//            }
+//            target_center = _armorDetectorPtr->getLightbarCenter();
+//            _solverPtr->setTarget(target_center, 0);
+//            //cout<<"lightbar!"<<endl;
+//            controlData.gimbal_mode = Serial::SERVO_MODE;
+//            controlData.shoot_mode  = Serial::NO_FIRE | Serial::HIGH_SPEED;
+//        }
+
+        /* find armor */
+        else if(controlData.gimbal_mode == Serial::SERVO_MODE)
+        {
+            switch (detect_mode)
+            {
+            case ARMOR_DETECT:
+                _armorDetectorPtr->loadImg(frame.img);
+                armorFlag = _armorDetectorPtr->detect();
+                waitKey(1);
+                if(armorFlag == ArmorDetector::ARMOR_NO)
+                {
+                    _sentryStrategiesPtr->popFrontAngle();
+                    controlData.gimbal_mode = Serial::PATROL_AROUND;
+                    controlData.pitch_dev   = 0;
+                    controlData.yaw_dev     = 0;
+                    if(_serialPtr->tryControl(controlData, chrono::milliseconds(1)) != Serial::OJBK)
+                    {
+                        cout<<"not sent"<< _serialPtr->getErrorCode() << endl;
+                    }
+                    //cout << "Deviation: " /*<< targetAngle */<< " !!!!!" << endl;
+                    continue;
+                }
+                if(armorFlag == ArmorDetector::ARMOR_LOCAL || armorFlag == ArmorDetector::ARMOR_GLOBAL)
+                {
+                    //cout<<"armor!"<<endl;
+                    armorVertex = _armorDetectorPtr->getArmorVertex();                 
+                    armorType = _armorDetectorPtr->getArmorType();
+                    //cout<<armorType<<endl;
+
+                    kcf_roi = get_kcf_roi(armorVertex);
+                    tracker.init(kcf_roi, frame.img);
+                    _solverPtr->setTarget(armorVertex, armorType);
+                    break;
+                }
+                else if(armorFlag == ArmorDetector::ARMOR_LOST)
+                {
+                    detect_mode = KCF_TRACKER;
+                    //cout<<"11111"<<endl;
+                    t1 = chrono::high_resolution_clock::now();
+                }
+
+//                if(_serialPtr->tryControl(controlData, chrono::milliseconds(2)) != Serial::OJBK)
+//                {
+//                    cout<<"not sent"<< _serialPtr->getErrorCode() << endl;
+//                }
+//                controlData.gimbal_mode = Serial::PATROL_AROUND;
+                cout<<"armor lost"<<endl;
+
+            case KCF_TRACKER:
+                //cout<<"qwe"<<endl;
+                t2 = chrono::high_resolution_clock::now();
+                chrono::duration<double, ratio<1,1>> duration_t(t2 - t1);
+
+                kcf_result = tracker.update(frame.img, &peak_value);
+                rectangle(frame.img, Point2f(kcf_result.x, kcf_result.y), Point2f(kcf_result.x + kcf_result.width,
+                                                                                  kcf_result.y + kcf_result.height), Scalar(0, 255, 255), 1, 8);
+                target_center = Point2f((kcf_result.x + kcf_result.width / 2), (kcf_result.y + kcf_result.height / 2));
+                circle(frame.img, target_center, 4, Scalar(0, 0, 255), 2); //
+                //cout << "Peak value: " << peak_value << endl; // With peak value
+                imshow("tracing", frame.img);
+                waitKey(1);
+                _solverPtr->setTarget(target_center, 0);
+
+                if (isTargetLost(peak_value, _para))
+                {
+                    cout << "target lost..." << endl;
+                    peak_value = 0;
+                    delete _para;
+                    _para = new para{ {0}, 0, 0, false };
+                    detect_mode = ARMOR_DETECT;
+                    continue;
+                }
+                if(duration_t.count() > 0.4)
+                {
+                    cout<< "kcf tracing time is over..."<<endl;
+                    peak_value = 0;
+                    delete _para;
+                    _para = new para{ {0}, 0, 0, false };
+                    detect_mode = ARMOR_DETECT;
+                    _armorDetectorPtr->getRect(kcf_result);
+                    break;
+                }
+                //break;
+            }
+
+        }
+
+        angleFlag = _solverPtr->solve();
+        if(angleFlag != rm::AngleSolver::ANGLE_ERROR)
+        {
+            targetAngle = _solverPtr->getCompensateAngle();
+            _sentryStrategiesPtr->pushBackAngle(targetAngle);
+
+            controlData.frame_seq   = frame.seq;
+            if(_sentryStrategiesPtr->ifHitTarget())
+                controlData.shoot_mode  = Serial::BURST_FIRE | Serial::HIGH_SPEED;
+            else
+                controlData.shoot_mode  = Serial::NO_FIRE | Serial::HIGH_SPEED;
+            controlData.pitch_dev   = targetAngle[1];
+            controlData.yaw_dev     = targetAngle[0];
+            //controlData.speed_on_rail = 0;
+
+            controlData.gimbal_mode = Serial::SERVO_MODE;
+            if(_serialPtr->tryControl(controlData, chrono::milliseconds(1)) != Serial::OJBK)
+            {
+                //cout<<"not sent "<< _serialPtr->getErrorCode() <<endl;
+            }
+            //std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            cout << "Deviation: " << targetAngle << endl;
+            //continue;
+        }
+
+        //cout << "angle error!";
+
+
+#ifdef _DEBUG
+        auto t2 = chrono::high_resolution_clock::now();
+        cout << "Total period: " << (static_cast<chrono::duration<double, std::milli>>(t2 - t1)).count() << " ms" << endl;
+        cout << endl;
+        t1 = t2;
+#endif
+
+#ifdef GET_VIDEO
+        if(isRecording)
+        {
+            writer << frame.img;
+        }
+        if(!writer.isOpened())
+        {
+            cout << "Capture failed." << endl;
+            continue;
+        }
+        isRecording = true;
+        cout << "Start capture. " + fileName +" created." << endl;
+        if(waitKey(1) == 'q')
+        {
+            return;
+        }
+#endif
+
+    }
+
+
+}
+}
