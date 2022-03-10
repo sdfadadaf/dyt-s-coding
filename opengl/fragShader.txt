@@ -1,0 +1,136 @@
+#version 330 core
+struct Material {
+    sampler2D texture_diffuse1;
+    sampler2D texture_specular1;
+	sampler2D texture_normal1;
+    float shininess;
+};
+struct DirLight{
+	vec3 direction;
+	vec3 color;
+};
+
+struct PointLight{
+	vec3 position;
+	vec3 color;
+
+	float constant;
+	float linear;
+	float quadratic;
+};
+
+struct SpotLight{
+	vec3 position;
+	vec3 direction;
+	vec3 color;
+
+	float cutoff;
+	float outCutoff;
+	
+	float constant;
+	float linear;
+	float quadratic;
+};
+
+in vec2 texCoord;
+//in vec3 normal;
+in vec3 shadingPos;
+out vec4 fragColor;
+
+uniform vec3 ambient;
+uniform vec3 viewPos;
+uniform DirLight dirLight;
+//uniform PointLight pointLight;
+uniform SpotLight spotLight;
+uniform Material material;
+uniform float near;
+uniform float far;
+
+vec3 CalcDirLight(DirLight light, vec3 _normal, vec3 viewDir);
+vec3 CalcPointLight(PointLight light, vec3 _normal, vec3 viewDir, vec3 shadingPos);
+vec3 CalcSpotLight(SpotLight light, vec3 _normal, vec3 viewDir, vec3 shadingPos);
+float LinerizeDepth(float depth);
+
+
+void main()
+{
+	//vec3 norm = normalize(normal);
+	//vec3 viewDir = normalize(viewPos - shadingPos);
+	
+	//vec3 result = vec3(0.0, 0.0, 0.0);
+	// directional light
+	//result += CalcDirLight(dirLight, norm, viewDir);
+	// point light
+	//result += CalcPointLight(pointLight, norm, viewDir, shadingPos);
+	// spot light
+	//result += CalcSpotLight(spotLight, norm, viewDir, shadingPos);
+
+	//float depth = LinerizeDepth(gl_FragCoord.z) / far;
+	fragColor = texture(material.texture_specular1, texCoord);
+
+}
+
+vec3 CalcDirLight(DirLight light, vec3 _normal, vec3 viewDir)
+{	
+	vec3 lightDir = normalize(-light.direction);
+	vec3 reflectDir = reflect(-lightDir, _normal);
+	
+	float diff = max(dot(_normal, lightDir), 0);
+	float spec = pow(max(dot(reflectDir, viewDir), 0), material.shininess);
+	//combination
+	vec3 _ambient = ambient * vec3(texture(material.texture_diffuse1, texCoord)) * light.color;
+	vec3 _diffuse = diff * vec3(texture(material.texture_diffuse1, texCoord)) * light.color;
+	vec3 _specular = spec * vec3(texture(material.texture_specular1, texCoord)) * light.color;
+	return (_ambient + _diffuse + _specular);
+}
+
+vec3 CalcPointLight(PointLight light, vec3 _normal, vec3 viewDir, vec3 shadingPos)
+{
+	vec3 lightDir = normalize(light.position - shadingPos);
+	vec3 reflectDir = reflect(-lightDir, _normal);
+
+	float diff = max(dot(lightDir, _normal), 0);	
+	float spec = pow(max(dot(reflectDir, viewDir), 0), material.shininess);
+	//attenuation
+	float distance = length(shadingPos - light.position);
+	float attenuation = 1.0 / (light.constant + light.linear * distance
+		+ light.quadratic * distance * distance);
+	//combination
+	vec3 _ambient = ambient * vec3(texture(material.texture_diffuse1, texCoord)) * light.color;
+	vec3 _diffuse = attenuation * diff * vec3(texture(material.texture_diffuse1, texCoord)) * light.color;
+	vec3 _specular = attenuation * spec * vec3(texture(material.texture_specular1, texCoord)) * light.color;
+	return (_ambient + _diffuse + _specular);
+}
+
+vec3 CalcSpotLight(SpotLight light, vec3 _normal, vec3 viewDir, vec3 shadingPos)
+{
+	vec3 lightDir = normalize(light.position - shadingPos);
+	vec3 _ambient = ambient * vec3(texture(material.texture_diffuse1, texCoord)) * light.color;
+
+	float theta = dot(normalize(light.direction), -lightDir);
+	float intensity = clamp((theta - light.outCutoff) / (light.cutoff - light.outCutoff), 0.0, 1.0);
+	if(intensity)
+	{
+		vec3 reflectDir = reflect(-lightDir, _normal);
+
+		float diff = max(dot(lightDir, _normal), 0);	
+		float spec = pow(max(dot(reflectDir, viewDir), 0), material.shininess);
+		// attenuation
+		float distance = length(shadingPos - light.position);
+		float attenuation = 1.0 / (light.constant + light.linear * distance
+		+ light.quadratic * distance * distance);
+		// combination
+		vec3 _diffuse = intensity * attenuation * diff * vec3(texture(material.texture_diffuse1, texCoord)) * light.color;
+		vec3 _specular = intensity * attenuation * spec * vec3(texture(material.texture_specular1, texCoord)) * light.color;
+		
+		return (_ambient + _diffuse + _specular);
+	}
+	else
+		return _ambient;
+}
+
+float LinerizeDepth(float depth)
+{
+	float ndc = depth * 2.0 - 1.0;
+	return (2.0 * near * far) / (near + far - ndc * (far - near));
+}
